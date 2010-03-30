@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+
+my $MONDEMAND_ADDR;
+my $MONDEMAND_PORT;
+
+my $conffile = "/etc/mondemand/mondemand.conf";
+if (-f $conffile)
+  {
+    open CONF, "< $conffile";
+    while (my $line = <CONF>)
+      {
+        chomp $line;
+        next if $line =~ m/^#/;
+        my ($key, $value) = split /=/, $line;
+        eval "\$$key = $value;";
+      }
+    close CONF;
+  }
+
+my $log_root_opt = undef;
+my $prog_id_opt  = undef;
+my $addr         = $MONDEMAND_ADDR || "127.0.0.1";
+my $port         = $MONDEMAND_PORT || "20402";
+my @logs         = ();
+my $match_opt    = undef;
+my $key_opt      = undef;
+
+GetOptions (
+            "prog_id=s"    => \$prog_id_opt,
+            "logdir=s"     => \$log_root_opt,
+            "log=s"        => \@logs,
+            "match=s"      => \$match_opt,
+            "key=s"        => \$key_opt,
+           );
+@logs = split (/,/, join (',', @logs));
+
+unless (defined ($log_root_opt))
+  {
+    print STDERR "ERROR: log root must be defined use '--logdir'\n";
+    exit 1;
+  }
+unless (defined ($prog_id_opt))
+  {
+    print STDERR "ERROR: prog id must be defined use '--prog_id'\n";
+    exit 1;
+  }
+unless (scalar (@logs) > 0)
+  {
+    print STDERR "ERROR: must define at least one log use '--log'\n";
+    exit 1;
+  }
+unless (defined ($match_opt))
+  {
+    print STDERR "ERROR: must define a match use '--match'\n";
+    exit 1;
+  }
+unless (defined ($key_opt))
+  {
+    print STDERR "ERROR: must define a key use '--key'\n";
+    exit 1;
+  }
+
+
+my $from =`hostname`;
+chomp $from;
+if ($from =~ m/^([^\.]*)/)
+  {
+    $from = $1;
+  }
+
+# sleep just a bit to make sure files have been rotated, etc
+sleep 2;
+
+# not get the time for last minute
+my $now = time;
+my $last_minute = $now - 60;
+
+my (undef, $l_min, $l_hour, $l_mday, $l_mon, $l_year) =
+   localtime ($last_minute);
+$l_year += 1900;
+$l_mon += 1;
+
+# then get a date to match from
+my $cass_date_fmt = "%04d-%02d-%02d %02d:%02d";
+my $match_date =
+   sprintf "$cass_date_fmt", $l_year, $l_mon, $l_mday, $l_hour, $l_min ;
+
+my $missing_log = 0;
+my $match_count = 0;
+foreach my $log_to_check (@logs)
+  {
+    my $log_path = $log_root_opt."/".$log_to_check;
+    if (! -f $log_path)
+      {
+        $missing_log = 1;
+      }
+    else
+      {
+        open FH, "< $log_path";
+        while (my $line = <FH>)
+          {
+            if ($line =~ m/$match_date/)
+              {
+                if ($line =~ m/$match_opt/)
+                  {
+                    $match_count++;
+                  }
+              }
+          }
+        close FH;
+      }
+  }
+
+# output the value
+my $args = "-p $prog_id_opt "
+          ."-o lwes::$addr:$port "
+          ."-c host=$from "
+          ."-s missing_log=$missing_log "
+          ."-s $key_opt=$match_count ";
+
+#print $args."\n";
+my $result = `mondemand-tool $args`;
+#print $result."\n";
+
+0;

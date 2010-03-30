@@ -1,0 +1,84 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+
+my $MONDEMAND_ADDR;
+my $MONDEMAND_PORT;
+
+my $conffile = "/etc/mondemand/mondemand.conf";
+if (-f $conffile)
+  {
+    open CONF, "< $conffile";
+    while (my $line = <CONF>)
+      {
+        chomp $line;
+        next if $line =~ m/^#/;
+        my ($key, $value) = split /=/, $line;
+        eval "\$$key = $value;";
+      }
+    close CONF;
+  }
+
+my $confdir = "/etc/mondemand/service_checks";
+opendir (DIR, $confdir) || die "can't opendir $confdir: $!";
+my @services = grep { ! /^\./ && -f "$confdir/$_" } readdir (DIR);
+closedir DIR;
+
+my $prog_id      = "service-check";
+my $addr         = $MONDEMAND_ADDR || "127.0.0.1";
+my $port         = $MONDEMAND_PORT || "20402";
+my $opt_help     = 0;
+
+GetOptions ('prog_id=s'    => \$prog_id,
+            'help'         => \$opt_help) or pod2usage (1);
+pod2usage (1) if ($opt_help);
+
+my $from =`hostname`;
+chomp $from;
+if ($from =~ m/^([^\.]*)/)
+  {
+    $from = $1;
+  }
+
+foreach my $service (@services)
+{
+  system ("/sbin/service $service status >/dev/null 2>&1");
+  my $ret = $? >> 8;
+  my $args =  "-p $prog_id "
+             ."-o lwes::$addr:$port "
+             ."-c host=$from "
+             ."-s $service=$ret";
+  my $result = `mondemand-tool $args`;
+}
+
+0;
+
+__END__
+
+=head1 NAME
+
+mondemand-service-check - check that various redhat services are running
+
+=head1 SYNOPSIS
+
+mondemand-service-check [options]
+
+ Options:
+   -prog_id   <program_id>
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-prog_id>
+
+Passed through to mondemand
+
+=back
+
+=head1 DESCRIPTION
+
+=cut

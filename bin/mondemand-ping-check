@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+
+my $MONDEMAND_ADDR;
+my $MONDEMAND_PORT;
+
+my $conffile = "/etc/mondemand/mondemand.conf";
+if (-f $conffile)
+  {
+    open CONF, "< $conffile";
+    while (my $line = <CONF>)
+      {
+        chomp $line;
+        next if $line =~ m/^#/;
+        my ($key, $value) = split /=/, $line;
+        eval "\$$key = $value;";
+      }
+    close CONF;
+  }
+
+my $confdir = "/etc/mondemand/ping_checks";
+opendir (DIR, $confdir) || die "can't opendir $confdir: $!";
+my @ping_hosts = grep { ! /^\./ && -f "$confdir/$_" } readdir (DIR);
+closedir DIR;
+
+my $prog_id      = "pinger";
+my $addr         = $MONDEMAND_ADDR || "127.0.0.1";
+my $port         = $MONDEMAND_PORT || "20402";
+my $opt_help   = 0;
+
+GetOptions ('prog_id=s'    => \$prog_id,
+            'help'         => \$opt_help) or pod2usage (1);
+pod2usage (1) if ($opt_help);
+
+my $from =`hostname`;
+chomp $from;
+if ($from =~ m/^([^\.]*)/)
+  {
+    $from = $1;
+  }
+my $ping_hosts = join (" ",@ping_hosts);
+my $fping_args = "-a -C 5 $ping_hosts 2>&1";
+my $fping_out = `/usr/sbin/fping $fping_args`;
+
+foreach my $line (split /\n/, $fping_out)
+  {
+    chomp $line;
+    my ($to, $times) = split /:/, $line;
+    if ($to =~ m/^([^\.]*)/)
+      {
+        $to = $1;
+      }
+    $times =~ s/^\s*//g;
+    $times =~ s/\s*$//g;
+    my @times = split /\s+/, $times;
+    my $min   = 3000000;
+    my $max   = 0;
+    my $avg   = 0.0;
+    my $sum   = 0;
+    my $count = 0;
+    my $error = 0;
+    foreach my $time (@times)
+      {
+        if ($time ne "-")
+          {
+            $count++;
+            $min = ($time < $min) ? $time : $min;
+            $max = ($time > $max) ? $time : $max;
+            $sum += $time;
+          }
+        else
+          {
+            $error++;
+          }
+      }
+    $avg = $sum / $count;
+    my $args =  "-p $prog_id "
+               ."-o lwes::$addr:$port "
+               ."-c host=$from "
+               ."-s min_ping_to_$to=".int($min*1000)." "
+               ."-s max_ping_to_$to=".int($max*1000)." "
+               ."-s avg_ping_to_$to=".int($avg*1000)." "
+               ."-s sum_ping_to_$to=".int($sum*1000)." "
+               ."-s tot_ping_to_$to=".$count." "
+               ."-s err_ping_to_$to=".$error." ";
+   my $result = `mondemand-tool $args`;
+  }
+
+0;
+
+__END__
+
+=head1 NAME
+
+mondemand-ping-check - ping various hosts and send results via mondemand
+
+=head1 SYNOPSIS
+
+mondemand-ping-check [options]
+
+ Options:
+   -prog_id   <program_id>
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-prog_id>
+
+Passed through to mondemand
+
+=back
+
+=head1 DESCRIPTION
+
+=cut
