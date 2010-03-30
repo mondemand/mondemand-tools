@@ -43,7 +43,7 @@ if ($from =~ m/^([^\.]*)/)
     $from = $1;
   }
 my $ping_hosts = join (" ",@ping_hosts);
-my $fping_args = "-a -C 5 $ping_hosts 2>&1";
+my $fping_args = "-a -C 55 $ping_hosts 2>&1";
 my $fping_out = `/usr/sbin/fping $fping_args`;
 
 foreach my $line (split /\n/, $fping_out)
