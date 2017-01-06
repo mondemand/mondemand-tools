@@ -1,3 +1,7 @@
+Version 0.1.0 (molinaro)
+  * added script to pull system UDP stats and forward to mondemand
+  * updated all scripts to use new mondemand-tool options
+
 Version 0.0.1 (molinaro)
   * put back ping total time to 55 seconds
 
