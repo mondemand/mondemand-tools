@@ -5,53 +5,68 @@ use warnings;
 use Getopt::Long;
 use Pod::Usage;
 
-my $MONDEMAND_ADDR;
-my $MONDEMAND_PORT;
-
-my $conffile = "/etc/mondemand/mondemand.conf";
-if (-f $conffile)
-  {
-    open CONF, "< $conffile";
-    while (my $line = <CONF>)
-      {
-        chomp $line;
-        next if $line =~ m/^#/;
-        my ($key, $value) = split /=/, $line;
-        eval "\$$key = $value;";
-      }
-    close CONF;
-  }
-
 my $confdir = "/etc/mondemand/service_checks";
 opendir (DIR, $confdir) || die "can't opendir $confdir: $!";
 my @services = grep { ! /^\./ && -f "$confdir/$_" } readdir (DIR);
 closedir DIR;
 
-my $prog_id      = "service-check";
-my $addr         = $MONDEMAND_ADDR || "127.0.0.1";
-my $port         = $MONDEMAND_PORT || "20402";
-my $opt_help     = 0;
+my $prog_id_opt = "service-check";
+my $dry_run_opt = 0;
+my $help_opt = 0;
 
-GetOptions ('prog_id=s'    => \$prog_id,
-            'help'         => \$opt_help) or pod2usage (1);
-pod2usage (1) if ($opt_help);
+GetOptions ('prog_id=s'    => \$prog_id_opt,
+            "dry-run|n"    => \$dry_run_opt,
+            'help'         => \$help_opt) or pod2usage (1);
+pod2usage (1) if ($help_opt);
 
-my $from =`hostname`;
-chomp $from;
-if ($from =~ m/^([^\.]*)/)
-  {
-    $from = $1;
-  }
-
+my $stats = "";
 foreach my $service (@services)
 {
   system ("/sbin/service $service status >/dev/null 2>&1");
   my $ret = $? >> 8;
-  my $args =  "-p $prog_id "
-             ."-o lwes::$addr:$port "
-             ."-c host=$from "
-             ."-s $service=$ret";
-  my $result = `mondemand-tool $args`;
+  $stats .= "-s ".join(":",("gauge",$service,$ret))." ";
+}
+
+my $args = "-p $prog_id_opt "
+          ."-o ".read_mondemand_config()." "
+          ."-c ".host_context()." "
+          .$stats;
+
+my $cmd = "mondemand-tool $args";
+
+if ($dry_run_opt) {
+  print "$cmd\n";
+} else {
+  system $cmd;
+}
+
+sub read_mondemand_config {
+  my $file = "/etc/mondemand/mondemand.conf";
+  my ($addr, $port, $ttl);
+  open (my $fh, "<", $file ) or die "can't open : $!";
+  while (my $line = <$fh>) {
+    chomp $line;
+    if ($line =~ m/MONDEMAND_ADDR="([0-9\.]+)"/) {
+      $addr = $1;
+    } elsif ($line =~ m/MONDEMAND_PORT="([0-9]+)"/) {
+      $port = $1;
+    } elsif ($line =~ m/MONDEMAND_TTL="([0-9]+)"/) {
+      $ttl = $1;
+    }
+  }
+  close ($fh);
+  die "can't parse : $!" if (! defined $addr and ! defined $port);
+  if (defined $ttl) {
+    return "lwes::$addr:$port:$ttl";
+  } else {
+    return "lwes::$addr:$port";
+  }
+}
+
+sub host_context {
+  my $host=`hostname -s`;
+  chomp $host;
+  return "host:$host";
 }
 
 0;

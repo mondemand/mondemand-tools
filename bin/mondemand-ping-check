@@ -5,43 +5,20 @@ use warnings;
 use Getopt::Long;
 use Pod::Usage;
 
-my $MONDEMAND_ADDR;
-my $MONDEMAND_PORT;
-
-my $conffile = "/etc/mondemand/mondemand.conf";
-if (-f $conffile)
-  {
-    open CONF, "< $conffile";
-    while (my $line = <CONF>)
-      {
-        chomp $line;
-        next if $line =~ m/^#/;
-        my ($key, $value) = split /=/, $line;
-        eval "\$$key = $value;";
-      }
-    close CONF;
-  }
-
 my $confdir = "/etc/mondemand/ping_checks";
 opendir (DIR, $confdir) || die "can't opendir $confdir: $!";
 my @ping_hosts = grep { ! /^\./ && -f "$confdir/$_" } readdir (DIR);
 closedir DIR;
 
-my $prog_id      = "pinger";
-my $addr         = $MONDEMAND_ADDR || "127.0.0.1";
-my $port         = $MONDEMAND_PORT || "20402";
-my $opt_help   = 0;
+my $prog_id_opt = "pinger";
+my $dry_run_opt = 0;
+my $help_opt = 0;
 
-GetOptions ('prog_id=s'    => \$prog_id,
-            'help'         => \$opt_help) or pod2usage (1);
-pod2usage (1) if ($opt_help);
+GetOptions ("prog_id=s"    => \$prog_id_opt,
+            "dry-run|n"    => \$dry_run_opt,
+            'help'         => \$help_opt) or pod2usage (1);
+pod2usage (1) if ($help_opt);
 
-my $from =`hostname`;
-chomp $from;
-if ($from =~ m/^([^\.]*)/)
-  {
-    $from = $1;
-  }
 my $ping_hosts = join (" ",@ping_hosts);
 my $fping_args = "-a -C 55 $ping_hosts 2>&1";
 my $fping_out = `/usr/sbin/fping $fping_args`;
@@ -78,17 +55,52 @@ foreach my $line (split /\n/, $fping_out)
           }
       }
     $avg = $sum / $count;
-    my $args =  "-p $prog_id "
-               ."-o lwes::$addr:$port "
-               ."-c host=$from "
-               ."-s min_ping_to_$to=".int($min*1000)." "
-               ."-s max_ping_to_$to=".int($max*1000)." "
-               ."-s avg_ping_to_$to=".int($avg*1000)." "
-               ."-s sum_ping_to_$to=".int($sum*1000)." "
-               ."-s tot_ping_to_$to=".$count." "
-               ."-s err_ping_to_$to=".$error." ";
-   my $result = `mondemand-tool $args`;
+    my $args = "-p $prog_id_opt "
+              ."-o ".read_mondemand_config()." "
+              ."-c ".host_context()." "
+              ."-s gauge:min_ping_to_$to:".int($min*1000)." "
+              ."-s gauge:max_ping_to_$to:".int($max*1000)." "
+              ."-s gauge:avg_ping_to_$to:".int($avg*1000)." "
+              ."-s gauge:sum_ping_to_$to:".int($sum*1000)." "
+              ."-s gauge:tot_ping_to_$to:".$count." "
+              ."-s gauge:err_ping_to_$to:".$error." ";
+    my $cmd = "mondemand-tool $args";
+
+    if ($dry_run_opt) {
+      print "$cmd\n";
+    } else {
+      system $cmd;
+    }
   }
+
+sub read_mondemand_config {
+  my $file = "/etc/mondemand/mondemand.conf";
+  my ($addr, $port, $ttl);
+  open (my $fh, "<", $file ) or die "can't open : $!";
+  while (my $line = <$fh>) {
+    chomp $line;
+    if ($line =~ m/MONDEMAND_ADDR="([0-9\.]+)"/) {
+      $addr = $1;
+    } elsif ($line =~ m/MONDEMAND_PORT="([0-9]+)"/) {
+      $port = $1;
+    } elsif ($line =~ m/MONDEMAND_TTL="([0-9]+)"/) {
+      $ttl = $1;
+    }
+  }
+  close ($fh);
+  die "can't parse : $!" if (! defined $addr and ! defined $port);
+  if (defined $ttl) {
+    return "lwes::$addr:$port:$ttl";
+  } else {
+    return "lwes::$addr:$port";
+  }
+}
+
+sub host_context {
+  my $host=`hostname -s`;
+  chomp $host;
+  return "host:$host";
+}
 
 0;
 
