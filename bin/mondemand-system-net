@@ -1,0 +1,236 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+my $allowed_protos = {
+                       "Ip" => 1,
+                       "Icmp" => 1,
+                       "IcmpMsg" => 1,
+                       "Tcp" => 1,
+                       "Udp" => 1,
+                       "UdpLite" => 1
+                     };
+# looked through the MIBs in /usr/share/snmp to figure out which are gauges
+my $gauges = { "Ip" => { "DefaultTTL" => 1,
+                         "Forwarding" => 1,
+                         "ReasmTimeout" => 1 },
+               "Icmp" => {},
+               "IcmpMsg" => {},
+               "Tcp" => { "CurrEstab" => 1 },
+               "Udp" => {},
+               "UdpLite" => {}
+             };
+my $wanted = {};
+
+my $prog_id_opt = undef;
+my $dry_run_opt = 0;
+
+GetOptions (
+  "prog_id=s" => \$prog_id_opt,
+  "dry-run|n" => \$dry_run_opt,
+  "metric=s@" => \&metric_handler,
+  "help" => sub { pod2usage(-exitval => 1, -output => \*STDOUT, -verbose => 1); },
+  "man" => sub { pod2usage(-exitval => 2, -output => \*STDOUT, -verbose => 2); }
+);
+
+# allow for metric argument to be of the form
+#
+# --metric <protocol>
+# --metric <protocol>:*
+# --metric <protocol>:<metric>
+#
+if (scalar keys %{$wanted} > 0) {
+  foreach my $proto (keys %{$wanted}) {
+    if (not exists $allowed_protos->{$proto}) {
+      print STDERR "ERROR: Protocol '$proto' is not one of ".join(",", (sort keys %{$allowed_protos}))."\n";
+      exit 1;
+    }
+    if ($wanted->{$proto} ne "*") {
+      my $has_wildcard = 0;
+      foreach my $metric (keys %{$wanted->{$proto}}) {
+        if ($metric eq "*") {
+          $has_wildcard = 1;
+        }
+      }
+      if ($has_wildcard) {
+        $wanted->{$proto} = "*";
+      }
+    }
+  }
+} else {
+  foreach my $allowed_protos (keys %{$allowed_protos}) {
+    $wanted->{$allowed_protos} = "*";
+  }
+}
+
+unless (defined ($prog_id_opt))
+  {
+    print STDERR "ERROR: prog id must be defined use '--prog_id'\n";
+    exit 1;
+  }
+
+my $sampl = sample();
+my $stats = "";
+foreach my $proto (sort keys %{$wanted}) {
+  my $source = $wanted->{$proto};
+  if ($wanted->{$proto} eq "*") {
+    $source = $sampl->{$proto};
+  }
+  foreach my $metric (sort keys %{$source}) {
+    $stats .= add_one_stat ($proto, $metric, $sampl->{$proto}{$metric});
+  }
+}
+
+my $args = "-p $prog_id_opt "
+          ."-o ".read_mondemand_config()." "
+          ."-c ".host_context()." "
+          .$stats;
+
+my $cmd = "mondemand-tool $args";
+
+if ($dry_run_opt) {
+  print "$cmd\n";
+} else {
+  system $cmd;
+}
+
+sub read_mondemand_config {
+  my $file = "/etc/mondemand/mondemand.conf";
+  my ($addr, $port, $ttl);
+  open (my $fh, "<", $file ) or die "can't open : $!";
+  while (my $line = <$fh>) {
+    chomp $line;
+    if ($line =~ m/MONDEMAND_ADDR="([0-9\.]+)"/) {
+      $addr = $1;
+    } elsif ($line =~ m/MONDEMAND_PORT="([0-9]+)"/) {
+      $port = $1;
+    } elsif ($line =~ m/MONDEMAND_TTL="([0-9]+)"/) {
+      $ttl = $1;
+    }
+  }
+  close ($fh);
+  die "can't parse : $!" if (! defined $addr and ! defined $port);
+  if (defined $ttl) {
+    return "lwes::$addr:$port:$ttl";
+  } else {
+    return "lwes::$addr:$port";
+  }
+}
+
+sub host_context {
+  my $host=`hostname -s`;
+  chomp $host;
+  return "host:$host";
+}
+
+sub sample {
+  my $f = "/proc/net/snmp";
+  open(my $fh,'<',$f) or die "Could not open $f : $!";
+  my @lines = <$fh>;
+  close $fh;
+  my $first = 1;
+  my $type = undef;
+  my @keys;
+  my @vals;
+  my $sample = {};
+  my $samples = {};
+  foreach my $line (@lines) {
+    chomp $line;
+    if ($line =~ m/([^:]+)/) {
+      $type = $1;
+      if ($first) {
+        @keys = split ('\s',$line);
+        $first = 0;
+      } else {
+        @vals = split ('\s',$line);
+        for (my $i = 1 ; $i < scalar @keys; $i++) {
+          $sample->{$keys[$i]} = $vals[$i];
+        }
+        $samples->{$type} = $sample;
+        $first = 1;
+        $type = undef;
+        $sample = {}
+      }
+    }
+  }
+  return $samples;
+}
+
+sub metric_handler {
+  my ($opt_name, $opt_value) = @_;
+  my ($k, $v) = split /:/, $opt_value;
+  if (defined ($v)) {
+    $wanted->{$k}{$v} = 1;
+  } else {
+    $wanted->{$k} = "*";
+  }
+}
+
+sub add_one_stat {
+  my ($proto, $metric, $value) = @_;
+  my $type = "counter";
+  if (exists $gauges->{$proto}{$metric} ) {
+    $type = "gauge";
+  }
+
+  return "-s ".join(":",($type,"$proto"."_"."$metric",$value))." ";
+}
+
+0;
+__END__
+
+=head1 NAME
+
+mondemand-system-net - gather network stats from /proc/net/snmp and pass to
+                       mondemand
+
+=head1 SYNOPSIS
+
+mondemand-system-net [options]
+
+  Options:
+    --prog_id <program_id>
+    --dry-run|-n
+    --metric <protocol>
+    --metric <protocol>:<metric>
+    --help
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--prog_id>
+
+Program Id for Mondemand
+
+=item B<--dry-run|-n>
+
+Print the command which would be used to send to mondemand
+
+=item B<--metric>
+
+Metrics to send, if left off all metrics found in /proc/net/snmp will be sent
+otherwise the following forms are allowed
+
+--metric <protocol>  - sends all metrics for the given protocol
+--metric <protocol>:<metric> - send the specific metric for the given protocol
+
+=item B<-help>
+
+This help
+
+=back
+
+=head1 DESCRIPTION
+
+Will capture stats from /proc/net/snmp and send to mondemand, usually used
+by adding this to a cronjob
+
+# send all Udp metrics to Mondemand
+* * * * * root mondemand-system-net --prog_id system --metric Udp
+
+=cut

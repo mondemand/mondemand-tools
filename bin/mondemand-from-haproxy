@@ -1,0 +1,260 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use LWP::UserAgent;
+use HTTP::Request;
+use Data::Dumper;
+use YAML;
+use Getopt::Long;
+use Pod::Usage;
+
+sub read_mondemand_config {
+  my ($file) = @_;
+  my ($addr, $port, $ttl);
+  open (my $fh, "<", $file ) or die "can't open : $!";
+  while (my $line = <$fh>) {
+    chomp $line;
+    if ($line =~ m/MONDEMAND_ADDR="([0-9\.]+)"/) {
+      $addr = $1;
+    } elsif ($line =~ m/MONDEMAND_PORT="([0-9]+)"/) {
+      $port = $1;
+    } elsif ($line =~ m/MONDEMAND_TTL="([0-9]+)"/) {
+      $ttl = $1;
+    }
+  }
+  close ($fh);
+  die "can't parse : $!" if (! defined $addr and ! defined $port);
+  if (defined $ttl) {
+    return "lwes::$addr:$port:$ttl";
+  } else {
+    return "lwes::$addr:$port";
+  }
+}
+
+sub read_config {
+  my ($config_file) = @_;
+  return YAML::LoadFile($config_file);
+}
+
+sub get_stats {
+  my ($csv_file, $stats_url) = @_;
+  my $lbstats;
+  if( defined $csv_file ) {
+    printf "Read from $csv_file\n";
+    local $/ = undef;
+    open (my $CSV, '<', $csv_file) or 
+      die sprintf "Cannot open CSV file: %s\n", $csv_file;
+    $lbstats = <$CSV>;
+    close ($CSV);
+  } else {
+    my $browser  = LWP::UserAgent->new;
+    my $response = $browser->get($stats_url);
+
+    if( ! $response->is_success ) {
+      printf "Failed to retrieve lbstats: %s\n", $response->status_line;
+      exit 1;
+    }
+    $lbstats = $response->content;
+  }
+
+  my $haproxy = {};
+  # parse csv file from haproxy
+  my @headers;
+  foreach (split /\n/,$lbstats) {
+    # skip empty lines
+    next if /^\s*$/;
+
+    # find headers
+    if ( /^\# (.+)/ ) {
+      my $headers_str = $1;
+      $headers_str =~ s/\s//g;
+      @headers = split(",", $headers_str);
+    } else {
+      # build stats hash
+      my @values = split(",");
+      my $pxname = $values[0];
+      my $svname = $values[1];
+      $haproxy->{$pxname} = {} unless defined ($haproxy->{$pxname});
+      if (defined ($svname) and $svname ne "") {
+        $haproxy->{$pxname}{$svname} = {} unless defined ($haproxy->{$pxname}{$svname});
+        my $value;
+        # we are only interested in certain columns
+        for ( my $index = 2; $index < scalar (@headers); $index++) {
+          if (defined($headers[$index]) and defined ($values[$index]) and
+              $values[$index] ne "") {
+            $haproxy->{$pxname}{$svname}{$headers[$index]} = $values[$index];
+          }
+        }
+      }
+    }
+  }
+
+  return $haproxy;
+}
+
+my $mondemand_config = "/etc/mondemand/mondemand.conf";
+my $config_file = "mondemand.yaml";
+my $csv_file = undef;
+my $opt_help = 0;
+my $dryrun = 0;
+my $dump = undef;
+
+GetOptions ('config_file=s' => \$config_file,
+            'csv=s' => \$csv_file,
+            'dry-run' => \$dryrun,
+            'dump=s' => \$dump,
+            'help' => \$opt_help) or pod2usage (1);
+pod2usage (1) if ($opt_help);
+
+# from section 9.1 of http://www.haproxy.org/download/1.6/doc/management.txt
+# these are 'gauges', the rest are assumed to be counters
+my %known_gauges = (
+ "qcur" => 1,
+ "qmax" => 1,
+ "scur" => 1,
+ "smax" => 1,
+ "slim" => 1,
+ "act" => 1,
+ "bck" => 1,
+ "lastchg" => 1,
+ "qlimit" => 1,
+ "rate" => 1,
+ "req_rate" => 1,
+ "req_rate_max" => 1,
+ "qtime" => 1,
+ "ctime" => 1,
+ "rtime" => 1,
+ "ttime" => 1
+);
+# non-numeric metrics, not sure how to treat these so just skip them
+my %non_numeric = (
+  "status" => 1,
+  "check_status" => 1,
+);
+
+if (defined($dump)) {
+  my $haproxy = get_stats ($csv_file, $dump);
+  print "stats_url: \"$dump\"\n";
+  print "program_id: FILL_ME_OUT\n";
+  print "metrics:\n";
+  foreach my $pxname (keys %{$haproxy}) {
+    print "  $pxname:\n";
+    foreach my $svname (keys %{$haproxy->{$pxname}}) {
+      print "    $svname:\n";
+      my $columns = $haproxy->{$pxname}{$svname};
+      print "      columns:\n";
+      foreach my $column (keys %{$columns}) {
+        next if !defined($columns->{$column}) or $columns->{$column} eq "";
+        next if defined($non_numeric{$column});
+        print "        $column:\n";
+        if (defined $known_gauges{$column}) {
+          print "          type: gauge\n";
+        }
+      }
+    }
+  }
+} else {
+  my $yaml_config = read_config ($config_file);
+  my $sendto= read_mondemand_config ($mondemand_config);
+
+  my $program_id = $yaml_config->{program_id};
+  if (!$program_id) {
+    die "Source role for Mondemand server is not found in the config file, $config_file.\n";
+  }
+
+  my $from = `hostname`;
+  if ($from =~ m/^([^\.]*)/)
+  {
+    $from = $1;
+    chomp $from;
+  }
+
+  my $stats_url = $yaml_config->{stats_url};
+
+  my $haproxy = get_stats ($csv_file, $stats_url);
+
+  my @stats;
+  # go through the metrics we want to collect, pulling them out and emitting
+  # in groups
+  my $metrics = $yaml_config->{metrics};
+  foreach my $pxname (keys %{$metrics}) {
+    foreach my $svname (keys %{$metrics->{$pxname}}) {
+      my $columns = $metrics->{$pxname}{$svname}{columns};
+      foreach my $column (keys %{$columns}) {
+        my $type = "counter";
+        if (defined ($columns->{$column}{type})) {
+          $type = $columns->{$column}{type};
+        }
+        my $value = $haproxy->{$pxname}{$svname}{$column};
+        if (defined ($value) and $value ne "") {
+          push @stats, "-s ".$type.":".$pxname."_".$svname."_".$column.":".$value;
+        }
+      }
+    }
+  }
+
+  my $common_args = "-p $program_id -o $sendto -c host:$from ";
+
+  # split up calls into sets of 100 stats
+  while (my @sub = splice(@stats, 0, 100)) {
+    my $cmd = "mondemand-tool $common_args ".join(" ",@sub);
+    if ($dryrun) {
+      print $cmd."\n";
+    } else {
+      `$cmd`;
+    }
+  }
+}
+__END__
+
+=head1 NAME
+
+mondemand-from-haproxy - gather haproxy stats and pass to mondemand
+
+=head1 SYNOPSIS
+
+mondemand-from-haproxy [options]
+
+ Options:
+   -config_file <config file>
+   -csv <csv file of stats>
+   -dry-run
+   -dump <url>
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-config_file>
+
+YAML config file
+
+=item B<-csv>
+
+Used mostly for testing
+
+=item B<-dump>
+
+Generate a config file with all allowed values give the stats url
+
+=back
+
+=head1 DESCRIPTION
+
+The expectation is this is added to a cronjob like so
+
+* * * * * root mondemand-from-haproxy --config_file /etc/mondemand/mondemand.yaml
+
+such that stats from the haproxy can be gathered.  In order to get a
+starting config file something like this should be run
+
+% mondemand-from-haproxy --dump <url> > /tmp/mondemand.yaml
+
+where <url> is the url for the haproxy cvs output (make sure to include the
+username and password in order for this to work).  This file should then
+be edited down to the stats you want graphs for, and the config moved to
+the location used in the cron.
+
+=cut
